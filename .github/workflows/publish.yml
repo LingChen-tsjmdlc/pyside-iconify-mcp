@@ -1,0 +1,188 @@
+name: Publish to PyPI
+
+# Publishes through PyPI Trusted Publishing (OIDC); no API token is stored.
+#
+# Release flow: push a version tag (for example `git tag v1.0.0 && git push origin v1.0.0`).
+# The workflow then
+#   1. runs the whole CI; a failure stops the release,
+#   2. builds the package and checks that the tag matches __version__,
+#   3. installs the built wheel in a clean environment and starts the server,
+#   4. waits for approval of the environment (if it has required reviewers),
+#   5. publishes to PyPI,
+#   6. creates the GitHub Release (notes generated, artifacts attached).
+# The Release is only created after PyPI accepted the upload.
+#
+# Manual run ("Run workflow" in Actions): choose testpypi or pypi. No GitHub Release
+# is created for manual runs.
+#
+# One-time setup (on pypi.org and test.pypi.org, Account -> Publishing ->
+# "Add a new pending publisher"):
+#   Project name:     pyside-iconify-mcp
+#   Owner:            LingChen-tsjmdlc
+#   Repository name:  pyside-iconify-mcp
+#   Workflow name:    publish.yml
+#   Environment:      pypi-release   (testpypi-release on TestPyPI)
+# Then create the same environments under the repository's Settings -> Environments,
+# with "Required reviewers" if you want a manual approval before every upload.
+
+on:
+    push:
+        tags:
+            - "v*"
+    workflow_dispatch:
+        inputs:
+            target:
+                description: "Where to publish"
+                type: choice
+                required: true
+                default: testpypi
+                options:
+                    - testpypi
+                    - pypi
+
+jobs:
+    # Release gate: the full CI must pass first. If any job fails, nothing below runs.
+    test:
+        name: Tests
+        uses: ./.github/workflows/ci.yml
+
+    build:
+        name: Build
+        needs: test
+        runs-on: ubuntu-latest
+        steps:
+            - name: Check out code
+              uses: actions/checkout@v4
+
+            - name: Install uv
+              uses: astral-sh/setup-uv@v4
+
+            - name: Install Python
+              run: uv python install 3.11
+
+            - name: Check tag matches package version
+              if: github.event_name == 'push'
+              run: |
+                  version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/pyside_iconify_mcp/__init__.py)
+                  tag="${GITHUB_REF_NAME#v}"
+                  echo "package version: $version, tag: $tag"
+                  test -n "$version"
+                  test "$version" = "$tag"
+
+            - name: Build wheel and sdist
+              run: |
+                  rm -rf dist/
+                  uv build --out-dir dist
+                  ls -la dist/
+
+            - name: Check artifacts
+              run: |
+                  python3 -m zipfile -l dist/pyside_iconify_mcp-*.whl | grep "pyside_iconify_mcp/py.typed"
+                  python3 -m zipfile -l dist/pyside_iconify_mcp-*.whl | grep "pyside_iconify_mcp/tools/check_code.py"
+                  python3 -m zipfile -l dist/pyside_iconify_mcp-*.whl | grep "pyside_iconify_mcp/common/library.py"
+                  python3 -m zipfile -l dist/*.whl | grep -E "\.workbuddy|\.vscode|__pycache__|\.pytest_cache|\.venv" && exit 1 || true
+                  tar -tzf dist/*.tar.gz | grep -E "\.workbuddy|\.vscode|__pycache__|\.pytest_cache|\.venv" && exit 1 || true
+                  tar -tzf dist/*.tar.gz | grep "LICENSE"
+                  tar -tzf dist/*.tar.gz | grep "README.md"
+                  uvx twine check dist/*
+
+            - name: Smoke test the built wheel in a clean environment
+              run: |
+                  uv venv --python 3.11 .smoke
+                  uv pip install --python .smoke/bin/python dist/*.whl
+                  cat > smoke.py <<'EOF'
+                  import asyncio
+
+                  from fastmcp import Client
+
+                  from pyside_iconify_mcp.server import mcp
+
+                  expected = {"search_icons", "check_icons", "get_reference", "check_code"}
+
+
+                  async def main() -> None:
+                      async with Client(mcp) as client:
+                          names = {tool.name for tool in await client.list_tools()}
+                          assert names == expected, names
+                          result = await client.call_tool("get_reference", {"topic": "overview"})
+                          assert "pyside-iconify overview" in result.content[0].text
+
+
+                  asyncio.run(main())
+                  print("smoke test passed")
+                  EOF
+                  .smoke/bin/python smoke.py
+                  rm -rf .smoke smoke.py
+
+            - name: Upload dist
+              uses: actions/upload-artifact@v4
+              with:
+                  name: dist
+                  path: dist/
+
+    publish-testpypi:
+        name: Publish to TestPyPI
+        needs: build
+        runs-on: ubuntu-latest
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'testpypi'
+        environment:
+            name: testpypi-release
+            url: https://test.pypi.org/project/pyside-iconify-mcp/
+        permissions:
+            id-token: write
+        steps:
+            - name: Download dist
+              uses: actions/download-artifact@v4
+              with:
+                  name: dist
+                  path: dist/
+
+            - name: Publish to TestPyPI
+              uses: pypa/gh-action-pypi-publish@release/v1
+              with:
+                  repository-url: https://test.pypi.org/legacy/
+
+    publish-pypi:
+        name: Publish to PyPI
+        needs: build
+        runs-on: ubuntu-latest
+        if: >-
+            github.event_name == 'push' ||
+            (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'pypi')
+        environment:
+            name: pypi-release
+            url: https://pypi.org/project/pyside-iconify-mcp/
+        permissions:
+            id-token: write
+        steps:
+            - name: Download dist
+              uses: actions/download-artifact@v4
+              with:
+                  name: dist
+                  path: dist/
+
+            - name: Publish to PyPI
+              uses: pypa/gh-action-pypi-publish@release/v1
+
+    github-release:
+        name: Create GitHub Release
+        needs: publish-pypi
+        runs-on: ubuntu-latest
+        if: github.event_name == 'push'
+        permissions:
+            contents: write
+        steps:
+            - name: Download dist
+              uses: actions/download-artifact@v4
+              with:
+                  name: dist
+                  path: dist/
+
+            - name: Create release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh release create "$GITHUB_REF_NAME" dist/* \
+                      --repo "$GITHUB_REPOSITORY" \
+                      --title "$GITHUB_REF_NAME" \
+                      --generate-notes
